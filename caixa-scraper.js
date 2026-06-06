@@ -33,12 +33,47 @@ async function scrapeCity(page, cityValue, cityName) {
 
     while (hasNextPage) {
       console.log(`Extracting data from page ${pageNum}...`);
-      
-      // Get all property links on this page (they contain "| R$")
-      const titles = await page.locator('a').filter({ hasText: '| R$' }).allInnerTexts();
-      console.log(`Found ${titles.length} property links on page ${pageNum}`);
 
-      titles.forEach(title => {
+      // Caixa renders two card layouts inside ".dadosimovel-col2":
+      //  1. Standard auction: the title anchor already includes "| R$ <price>".
+      //  2. "Venda Direta Online": the title anchor has no price; the value is
+      //     in a separate span as "Valor mínimo de venda: R$ <price>".
+      // Normalize both into the clean "TITLE | R$ PRICE" format.
+      let titles = await page.locator('.dadosimovel-col2').evaluateAll((nodes) =>
+        nodes
+          .map((node) => {
+            const link = node.querySelector('a');
+            const title = link
+              ? link.innerText.trim().replace(/\s+/g, ' ')
+              : '';
+            if (!title) return '';
+            if (/\|\s*R\$/.test(title)) return title;
+            const text = node.innerText;
+            const avaliacao = text.match(
+              /Valor de avalia[çc][aã]o:\s*(R\$\s?[\d.,]+)/i
+            );
+            const minimo = text.match(
+              /Valor m[ií]nimo de venda:\s*(R\$\s?[\d.,]+)/i
+            );
+            const parts = [avaliacao?.[1], minimo?.[1]].filter(Boolean);
+            return parts.length > 0
+              ? `${title} | ${parts.join(', ')}`
+              : title;
+          })
+          .filter((text) => text.length > 0)
+      );
+
+      // Fallback to the legacy anchor-based layout when no cards are present.
+      if (titles.length === 0) {
+        titles = await page
+          .locator('a')
+          .filter({ hasText: '| R$' })
+          .allInnerTexts();
+      }
+
+      console.log(`Found ${titles.length} properties on page ${pageNum}`);
+
+      titles.forEach((title) => {
         allResults.push(title.trim());
       });
 
