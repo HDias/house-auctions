@@ -1,7 +1,49 @@
 import { chromium } from 'playwright';
 import fs from 'fs';
 
-async function scrapeCity(page, cityValue, cityName) {
+const SEARCH_URL =
+  'https://venda-imoveis.caixa.gov.br/sistema/busca-imovel.asp?sltTipoBusca=imoveis';
+
+// `cities: null` means every city listed for that state.
+const TARGETS = [
+  { state: 'TO', cities: null },
+  { state: 'GO', cities: ['GOIANIA'] }
+];
+
+// Caixa mixes accented and unaccented spellings (e.g. "GOIÂNIA"), so compare
+// on a diacritic-free uppercase form.
+function normalize(text) {
+  return text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toUpperCase();
+}
+
+function slugify(text) {
+  return normalize(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+async function selectState(page, state) {
+  await page.goto(SEARCH_URL);
+  console.log(`Selecting State: ${state}...`);
+  await page.locator('#cmb_estado').selectOption(state);
+  // The city list is loaded by AJAX and can take several seconds for states
+  // with many cities, so wait for it to be populated rather than a fixed delay.
+  await page.waitForFunction(
+    () => {
+      const select = document.querySelector('#cmb_cidade');
+      return select !== null && select.options.length > 1;
+    },
+    null,
+    { timeout: 30000 }
+  );
+}
+
+async function scrapeCity(page, state, cityValue, cityName) {
   console.log(`\n--- Starting Scrape for ${cityName} ---`);
 
   try {
@@ -28,11 +70,18 @@ async function scrapeCity(page, cityValue, cityName) {
     await page.waitForTimeout(2000);
 
     let allResults = [];
-    let hasNextPage = true;
     let pageNum = 1;
 
-    while (hasNextPage) {
-      console.log(`Extracting data from page ${pageNum}...`);
+    // "#paginacao" lists every page as a link calling carregaListaImoveis(n),
+    // with the current page wrapped in <b>. It is absent for single-page results.
+    const totalPages = Math.max(
+      1,
+      await page.locator('#paginacao a').count()
+    );
+    console.log(`Total pages: ${totalPages}`);
+
+    while (pageNum <= totalPages) {
+      console.log(`Extracting data from page ${pageNum} of ${totalPages}...`);
 
       // Caixa renders two card layouts inside ".dadosimovel-col2":
       //  1. Standard auction: the title anchor already includes "| R$ <price>".
@@ -77,15 +126,20 @@ async function scrapeCity(page, cityValue, cityName) {
         allResults.push(title.trim());
       });
 
-      const nextLink = page.locator(`span.navegacao a:text("${pageNum + 1}")`);
-      if (await nextLink.count() > 0) {
-        console.log(`Moving to page ${pageNum + 1}...`);
-        await nextLink.first().click();
-        await page.waitForTimeout(2000);
-        pageNum++;
-      } else {
-        hasNextPage = false;
+      if (pageNum < totalPages) {
+        const nextPage = pageNum + 1;
+        console.log(`Moving to page ${nextPage}...`);
+        await page.evaluate((n) => carregaListaImoveis(n), nextPage);
+        // The list is replaced in place, so wait for the <b> marker to move.
+        await page.waitForFunction(
+          (n) =>
+            document.querySelector('#paginacao b')?.innerText.trim() ===
+            String(n),
+          nextPage,
+          { timeout: 30000 }
+        );
       }
+      pageNum++;
     }
 
     if (allResults.length > 0) {
@@ -93,9 +147,9 @@ async function scrapeCity(page, cityValue, cityName) {
       const day = String(date.getDate()).padStart(2, '0');
       const month = String(date.getMonth() + 1).padStart(2, '0');
       const year = date.getFullYear();
-      const fileName = `${cityName.toLowerCase()}_${day}-${month}-${year}.md`;
+      const fileName = `${day}-${month}-${year}_${slugify(cityName)}_${state.toLowerCase()}.md`;
 
-      let markdownContent = `# Property Results for ${cityName.toUpperCase()} - ${day}/${month}/${year}\n\n`;
+      let markdownContent = `# Property Results for ${cityName.toUpperCase()}/${state} - ${day}/${month}/${year}\n\n`;
       markdownContent += `Total properties found: ${allResults.length}\n\n`;
       markdownContent += `| Property Title |\n`;
       markdownContent += `| :--- |\n`;
@@ -122,16 +176,12 @@ async function scrapeCity(page, cityValue, cityName) {
       await page.waitForTimeout(1000);
     } else {
       console.log("'Alterar' link not found. Navigating back to start.");
-      await page.goto('https://venda-imoveis.caixa.gov.br/sistema/busca-imovel.asp?sltTipoBusca=imoveis');
-      await page.locator('#cmb_estado').selectOption('TO');
-      await page.waitForTimeout(1000);
+      await selectState(page, state);
     }
 
   } catch (error) {
     console.error(`Error during scraping for ${cityName}:`, error);
-    await page.goto('https://venda-imoveis.caixa.gov.br/sistema/busca-imovel.asp?sltTipoBusca=imoveis');
-    await page.locator('#cmb_estado').selectOption('TO');
-    await page.waitForTimeout(1000);
+    await selectState(page, state);
   }
 }
 
@@ -145,31 +195,36 @@ async function run() {
 
   try {
     console.log('Navigating to Caixa Imóveis...');
-    await page.goto('https://venda-imoveis.caixa.gov.br/sistema/busca-imovel.asp?sltTipoBusca=imoveis');
 
-    console.log('Selecting State: TO...');
-    await page.locator('#cmb_estado').selectOption('TO');
-    await page.waitForTimeout(1000);
+    for (const { state, cities } of TARGETS) {
+      await selectState(page, state);
 
-    const cityOptions = await page.locator('#cmb_cidade option').evaluateAll(options =>
-      options.map(opt => ({ value: opt.value, text: opt.innerText.trim() }))
-    );
+      const cityOptions = await page.locator('#cmb_cidade option').evaluateAll(options =>
+        options
+          .map(opt => ({ value: opt.value, text: opt.innerText.trim() }))
+          // The first option is the "Selecione" placeholder with an empty value.
+          .filter(opt => opt.value && opt.text)
+      );
 
-    const targetCities = cityOptions.filter(opt =>
-        opt.text.toUpperCase() === 'PALMAS' ||
-        opt.text.toUpperCase() === 'GURUPI'
-    );
+      const wanted = cities?.map(normalize);
+      const targetCities = wanted
+        ? cityOptions.filter(opt => wanted.includes(normalize(opt.text)))
+        : cityOptions;
 
-    if (targetCities.length === 0) {
-      console.log("Neither PALMAS nor GURUPI found in the list.");
-      // Fallback: log if Palmas specifically is missing
-      if (!cityOptions.some(opt => opt.text.toUpperCase() === 'PALMAS')) {
-        console.log('does not exists palmas');
+      if (wanted) {
+        const missing = wanted.filter(
+          name => !cityOptions.some(opt => normalize(opt.text) === name)
+        );
+        missing.forEach(name =>
+          console.log(`City not found in ${state}: ${name}`)
+        );
       }
-    }
 
-    for (const city of targetCities) {
-      await scrapeCity(page, city.value, city.text);
+      console.log(`\n=== ${state}: ${targetCities.length} cities to scrape ===`);
+
+      for (const city of targetCities) {
+        await scrapeCity(page, state, city.value, city.text);
+      }
     }
 
   } catch (error) {
