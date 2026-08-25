@@ -1,5 +1,6 @@
 import { chromium } from 'playwright';
 import fs from 'fs';
+import path from 'path';
 
 const SEARCH_URL =
   'https://venda-imoveis.caixa.gov.br/sistema/busca-imovel.asp?sltTipoBusca=imoveis';
@@ -9,6 +10,16 @@ const TARGETS = [
   { state: 'TO', cities: null },
   { state: 'GO', cities: ['GOIANIA'] }
 ];
+
+// Single timestamp for the whole run so every file of a run shares one date,
+// even if the scrape crosses midnight.
+const RUN_DATE = (() => {
+  const date = new Date();
+  const day = String(date.getDate()).padStart(2, '0');
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const year = date.getFullYear();
+  return { day, month, year, stamp: `${day}-${month}-${year}` };
+})();
 
 // Caixa mixes accented and unaccented spellings (e.g. "GOIÂNIA"), so compare
 // on a diacritic-free uppercase form.
@@ -25,6 +36,26 @@ function slugify(text) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-|-$/g, '');
+}
+
+// Parse a Brazilian currency string like "R$ 119.000,00" into a numeric value.
+// Returns the first price found, or Infinity if none can be parsed (so unparseable
+// entries sort to the end).
+function parsePrice(text) {
+  const match = text.match(/R\$\s?([\d.,]+)/);
+  if (!match) return Infinity;
+  // Brazilian format: dots are thousands separators, comma is decimal.
+  return parseFloat(match[1].replace(/\./g, '').replace(',', '.'));
+}
+
+// Escape a value for CSV: wrap in double-quotes if it contains commas, quotes, or
+// newlines, doubling any existing double-quotes per RFC 4180.
+function csvEscape(value) {
+  const str = String(value);
+  if (/[",\n\r]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
 }
 
 async function selectState(page, state) {
@@ -143,11 +174,13 @@ async function scrapeCity(page, state, cityValue, cityName) {
     }
 
     if (allResults.length > 0) {
-      const date = new Date();
-      const day = String(date.getDate()).padStart(2, '0');
-      const month = String(date.getMonth() + 1).padStart(2, '0');
-      const year = date.getFullYear();
-      const fileName = `${day}-${month}-${year}_${slugify(cityName)}_${state.toLowerCase()}.md`;
+      const { day, month, year, stamp } = RUN_DATE;
+      const outputDir = stamp;
+      fs.mkdirSync(outputDir, { recursive: true });
+      const fileName = path.join(
+        outputDir,
+        `${stamp}_${slugify(cityName)}_${state.toLowerCase()}.md`
+      );
 
       let markdownContent = `# Property Results for ${cityName.toUpperCase()}/${state} - ${day}/${month}/${year}\n\n`;
       markdownContent += `Total properties found: ${allResults.length}\n\n`;
@@ -170,18 +203,26 @@ async function scrapeCity(page, state, cityValue, cityName) {
       console.log("Clicking 'Alterar' (Step 1) to reset for next city...");
       await resetLink.click();
       await page.waitForTimeout(1000);
-    } else if (await page.getByRole('link', { name: ' Alterar' }).count() > 0) {
+    } else if (await page.getByRole('link', { name: ' Alterar' }).count() > 0) {
       console.log("Clicking 'Alterar' (General) to reset for next city...");
-      await page.getByRole('link', { name: ' Alterar' }).first().click();
+      await page.getByRole('link', { name: ' Alterar' }).first().click();
       await page.waitForTimeout(1000);
     } else {
       console.log("'Alterar' link not found. Navigating back to start.");
       await selectState(page, state);
     }
 
+    return allResults.map((title) => ({
+      city: cityName,
+      state,
+      title: title.replace(/[\n\r]+/g, ' '),
+      price: parsePrice(title)
+    }));
+
   } catch (error) {
     console.error(`Error during scraping for ${cityName}:`, error);
     await selectState(page, state);
+    return [];
   }
 }
 
@@ -195,6 +236,7 @@ async function run() {
 
   try {
     console.log('Navigating to Caixa Imóveis...');
+    const allProperties = [];
 
     for (const { state, cities } of TARGETS) {
       await selectState(page, state);
@@ -223,8 +265,29 @@ async function run() {
       console.log(`\n=== ${state}: ${targetCities.length} cities to scrape ===`);
 
       for (const city of targetCities) {
-        await scrapeCity(page, state, city.value, city.text);
+        const results = await scrapeCity(page, state, city.value, city.text);
+        allProperties.push(...results);
       }
+    }
+
+    // Generate a single CSV with all properties sorted by value (ascending).
+    if (allProperties.length > 0) {
+      allProperties.sort((a, b) => a.price - b.price);
+
+      const csvFileName = `${RUN_DATE.stamp}_all-properties.csv`;
+
+      const header = 'City,State,Property,Value';
+      const rows = allProperties.map(
+        (p) =>
+          `${csvEscape(p.city)},${csvEscape(p.state)},${csvEscape(p.title)},${p.price === Infinity ? '' : p.price.toFixed(2)}`
+      );
+
+      fs.writeFileSync(csvFileName, [header, ...rows].join('\n'));
+      console.log(
+        `\nGenerated ${csvFileName} with ${allProperties.length} properties sorted by value.`
+      );
+    } else {
+      console.log('\nNo properties found across all targets.');
     }
 
   } catch (error) {
